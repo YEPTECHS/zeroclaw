@@ -1,0 +1,83 @@
+# syntax=docker/dockerfile:1
+# ZeroClaw Agent — built from source
+# Multi-stage: build frontend dist, compile rust binary, copy into slim runtime
+
+# ── Stage 0: Frontend Node base ─────────────────────────────────
+FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS web-node
+
+# ── Stage 1: Frontend build ─────────────────────────────────────
+# Run natively on the build host (output is static files, not arch-specific),
+# avoiding QEMU-emulated rustc segfaults when targeting linux/amd64 on ARM hosts.
+FROM --platform=$BUILDPLATFORM rust:1.94-slim AS web-builder
+WORKDIR /app
+COPY --from=web-node /usr/local/bin/node /usr/local/bin/node
+COPY --from=web-node /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN apt-get update && apt-get install -y \
+        pkg-config \
+    && ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
+    && rm -rf /var/lib/apt/lists/*
+COPY web/package.json web/package-lock.json web/
+RUN cd web && npm ci --ignore-scripts
+COPY . .
+RUN mkdir -p apps/tauri/src \
+    && echo "fn main() {}" > apps/tauri/src/main.rs \
+    && echo "fn main() {}" > apps/tauri/build.rs
+RUN cargo web build
+
+# ── Stage 2: Build (Native Builder cross-compiling for x86_64) ──
+FROM --platform=$BUILDPLATFORM rust:1.94-slim AS builder
+
+WORKDIR /build
+
+# Install cross-compilation tools
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    gcc-x86-64-linux-gnu \
+    libc6-dev-amd64-cross \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN rustup target add x86_64-unknown-linux-gnu
+
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc \
+    CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc \
+    CXX_x86_64_unknown_linux_gnu=x86_64-linux-gnu-g++ \
+    PKG_CONFIG_ALLOW_CROSS=1
+
+COPY . .
+
+# apps/tauri: .dockerignore whitelists only Cargo.toml; stub src and build.rs
+# so the workspace manifest parses during the release build.
+RUN mkdir -p apps/tauri/src \
+    && echo "fn main() {}" > apps/tauri/src/main.rs \
+    && echo "fn main() {}" > apps/tauri/build.rs
+
+RUN cargo build --release --target x86_64-unknown-linux-gnu \
+    && x86_64-linux-gnu-strip target/x86_64-unknown-linux-gnu/release/zeroclaw
+
+# ── Stage 3: Runtime (Targeted for amd64) ──
+FROM --platform=linux/amd64 debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl jq \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/x86_64-unknown-linux-gnu/release/zeroclaw /usr/local/bin/zeroclaw
+# Install the dashboard at /usr/share/zeroclawlabs/web/dist (outside the
+# documented /zeroclaw-data mount) so user volumes do not shadow it (#6400).
+COPY --from=web-builder /app/web/dist /usr/share/zeroclawlabs/web/dist
+
+# RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace && \
+#     chown -R 65534:65534 /zeroclaw-data
+
+# ENV LANG=C.UTF-8
+# ENV HOME=/zeroclaw-data
+# ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
+
+# WORKDIR /zeroclaw-data
+# USER 65534:65534
+# EXPOSE 42617
+
+# ENTRYPOINT ["zeroclaw"]
+# CMD ["gateway"]
